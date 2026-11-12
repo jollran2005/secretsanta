@@ -1,338 +1,361 @@
-import os
-import logging
-import random
+"""Discord Secret Santa bot with interactive, per-draw setup."""
+
 import asyncio
+import logging
+import os
+import random
+from math import gcd
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from math import gcd
-import json
-import pathlib
 
-# File to store exclusions (IDs and display names for readability)
-EXCLUSIONS_FILE = pathlib.Path('exclusions.json')
-DEFAULT_EXCLUSIONS_FILE = EXCLUSIONS_FILE
-
-
-class ExclusionStore:
-    """Manages persistent storage of exclusions with JSON backing."""
-    # allow tests to monkeypatch this path as ExclusionStore.EXCLUSIONS_FILE
-    EXCLUSIONS_FILE = EXCLUSIONS_FILE
-
-    def __init__(self):
-        self.exclusions = set()  # set of frozenset(id1, id2)
-        self.display_names = {}  # id -> most recent display_name mapping
-        self._load()
-
-    def _load(self):
-        """Load exclusions from JSON if file exists."""
-        # When running under pytest, avoid loading the global persistent exclusions
-        # only when using the default path, so tests that set a custom
-        # ExclusionStore.EXCLUSIONS_FILE can still exercise persistence.
-        if 'pytest' in __import__('sys').modules and self.EXCLUSIONS_FILE == DEFAULT_EXCLUSIONS_FILE:
-            return
-        if not self.EXCLUSIONS_FILE.exists():
-            return
-        try:
-            with self.EXCLUSIONS_FILE.open() as f:
-                data = json.load(f)
-                # Reconstruct frozensets from ID pairs
-                self.exclusions = {frozenset(pair) for pair in data.get('exclusions', [])}
-                self.display_names = data.get('display_names', {})
-        except Exception as e:
-            logging.error(f'Failed to load exclusions: {e}')
-
-    def _save(self):
-        """Save current exclusions to JSON."""
-        try:
-            data = {
-                'exclusions': [list(pair) for pair in self.exclusions],
-                'display_names': self.display_names
-            }
-            with self.EXCLUSIONS_FILE.open('w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logging.error(f'Failed to save exclusions: {e}')
-
-    def add(self, user1: discord.Member, user2: discord.Member) -> bool:
-        """Add an exclusion pair. Returns True if this was a new exclusion."""
-        pair = frozenset((user1.id, user2.id))
-        if pair in self.exclusions:
-            return False
-
-        self.exclusions.add(pair)
-        # Update display names (for list command readability)
-        self.display_names[str(user1.id)] = user1.display_name
-        self.display_names[str(user2.id)] = user2.display_name
-        self._save()
-        return True
-
-    def remove(self, user1: discord.Member, user2: discord.Member) -> bool:
-        """Remove an exclusion pair. Returns True if found and removed."""
-        pair = frozenset((user1.id, user2.id))
-        if pair not in self.exclusions:
-            return False
-
-        self.exclusions.remove(pair)
-        self._save()
-        return True
-
-    def format_list(self) -> str:
-        """Return a human-readable list of current exclusions."""
-        if not self.exclusions:
-            return "No exclusions configured."
-
-        lines = []
-        for pair in self.exclusions:
-            id1, id2 = pair
-            name1 = self.display_names.get(str(id1), f'Unknown({id1})')
-            name2 = self.display_names.get(str(id2), f'Unknown({id2})')
-            lines.append(f'- {name1} ↔ {name2}')
-        return 'Current exclusions:\n' + '\n'.join(sorted(lines))
-
-
-# Global exclusion store, loaded at startup
-exclusion_store = ExclusionStore()
 
 logging.basicConfig(level=logging.INFO)
-
-# Read the token from an environment variable for safety
-# Load environment variables from a .env file (if present) and then from the environment
 load_dotenv()
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-if not DISCORD_BOT_TOKEN:
-    # This file may be run directly; if the token is missing, inform the user and exit.
-    logging.error('Environment variable DISCORD_BOT_TOKEN is not set. Set it and restart the bot.')
-    # Do not attempt to run the bot without a token.
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 intents = discord.Intents.all()
 intents.members = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-bot = commands.Bot(command_prefix='/', intents=intents)
+
+class DrawParticipant:
+    """A Discord user with the display name chosen for this draw."""
+
+    def __init__(self, user, display_name=None):
+        self.user = user
+        self.id = user.id
+        self.display_name = display_name or user.display_name
+        self.bot = user.bot
+
+    async def send(self, message):
+        await self.user.send(message)
 
 
-# Enable app commands (slash commands)
+def _rotate_list(items, step):
+    """Return a copy rotated right by step positions."""
+    if not items:
+        return []
+    return [items[(index - step) % len(items)] for index in range(len(items))]
+
+
+def _make_assignments(participants, exclusions=None, single_cycle=False, max_attempts=2000):
+    """Create a valid Secret Santa permutation or return None."""
+    participants = list(participants)
+    if len(participants) < 2:
+        raise ValueError("Need at least 2 participants")
+
+    exclusions = exclusions or set()
+    random.shuffle(participants)
+
+    def valid(receivers):
+        return all(
+            giver.id != receiver.id
+            and frozenset((giver.id, receiver.id)) not in exclusions
+            for giver, receiver in zip(participants, receivers)
+        )
+
+    if single_cycle:
+        steps = [step for step in range(1, len(participants)) if gcd(step, len(participants)) == 1]
+        random.shuffle(steps)
+        for step in steps:
+            receivers = _rotate_list(participants, step)
+            if valid(receivers):
+                return list(zip(participants, receivers))
+        return None
+
+    receivers = participants.copy()
+    for _ in range(max_attempts):
+        random.shuffle(receivers)
+        if valid(receivers):
+            return list(zip(participants, receivers))
+    return None
+
+
+async def _send_assignments(interaction, assignments, role_name):
+    """DM every participant and report any delivery failures."""
+    failed = []
+    for giver, receiver in assignments:
+        message = (
+            f"God jul {giver.display_name}! Jag har något att säga till dig — håll det hemligt:\n"
+            f"Du har blivit tilldelad att ge en julklapp till {receiver.display_name}."
+        )
+        try:
+            await giver.send(message)
+        except discord.HTTPException:
+            logging.exception("Failed to send DM to user %s", giver.id)
+            failed.append(giver)
+        await asyncio.sleep(0.5)
+
+    if failed:
+        names = ", ".join(user.display_name for user in failed)
+        await interaction.followup.send(
+            f"Sent assignments to {len(assignments) - len(failed)} participants; "
+            f"failed to DM {len(failed)}: {names}."
+        )
+    else:
+        await interaction.followup.send(
+            f"Secret Santa assignments sent by DM to {len(assignments)} participants "
+            f"(role: {role_name})."
+        )
+
+
+class ExternalUserModal(discord.ui.Modal, title="Add external participant"):
+    user_id = discord.ui.TextInput(
+        label="Discord user ID",
+        placeholder="Enter the numeric Discord user ID",
+        min_length=1,
+        max_length=20,
+    )
+    nickname = discord.ui.TextInput(
+        label="Nickname",
+        placeholder="Name to use in the draw and DM messages",
+        min_length=1,
+        max_length=100,
+    )
+
+    def __init__(self, setup_view):
+        super().__init__()
+        self.setup_view = setup_view
+
+    async def on_submit(self, interaction):
+        try:
+            user_id = int(self.user_id.value.strip())
+            user = await bot.fetch_user(user_id)
+        except (ValueError, discord.NotFound):
+            await interaction.response.send_message(
+                "That is not a valid, resolvable Discord user ID.", ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "Discord could not resolve that user right now.", ephemeral=True
+            )
+            return
+
+        if user.bot:
+            await interaction.response.send_message(
+                "Bot accounts cannot participate.", ephemeral=True
+            )
+            return
+        if any(participant.id == user.id for participant in self.setup_view.external_users):
+            await interaction.response.send_message(
+                "That user is already included.", ephemeral=True
+            )
+            return
+
+        participant = DrawParticipant(user, self.nickname.value.strip())
+        self.setup_view.external_users.append(participant)
+        await interaction.response.send_message(
+            f"Added external participant: {participant.display_name}.", ephemeral=True
+        )
+        await self.setup_view.refresh(interaction)
+
+
+class ExclusionPairView(discord.ui.View):
+    def __init__(self, setup_view):
+        super().__init__(timeout=300)
+        self.setup_view = setup_view
+        participants = setup_view.all_participants
+        self.user_select = discord.ui.Select(
+            placeholder="Select two participants",
+            min_values=2,
+            max_values=2,
+            options=[
+                discord.SelectOption(
+                    label=participant.display_name[:100],
+                    value=str(participant.id),
+                )
+                for participant in participants[:25]
+            ],
+        )
+        self.user_select.callback = self.pair_selected
+        self.add_item(self.user_select)
+
+    async def pair_selected(self, interaction):
+        first, second = (int(value) for value in self.user_select.values)
+        pair = frozenset((first, second))
+        if pair in self.setup_view.exclusions:
+            await interaction.response.send_message(
+                "That exclusion pair already exists.", ephemeral=True
+            )
+            return
+
+        self.setup_view.exclusions.add(pair)
+        await interaction.response.edit_message(
+            content="Exclusion pair added.", view=None
+        )
+        await self.setup_view.refresh(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(
+            content="Exclusion pair selection cancelled.", view=None
+        )
+
+
+class DrawSetupView(discord.ui.View):
+    def __init__(self, owner_id, role, participants, single_cycle=False):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.role = role
+        self.participants = list(participants)
+        self.external_users = []
+        self.exclusions = set()
+        self.single_cycle = single_cycle
+        self.message = None
+
+    @property
+    def all_participants(self):
+        return self.participants + self.external_users
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who started this setup can use it.", ephemeral=True
+            )
+            return False
+        return True
+
+    def summary(self):
+        external = ", ".join(user.display_name for user in self.external_users) or "none"
+        pairs = ", ".join(
+            f"{first} ↔ {second}" for first, second in self.exclusions
+        ) or "none"
+        mode = "single circle" if self.single_cycle else "normal draw"
+        return (
+            f"**Role:** {self.role.name}\n"
+            f"**Participants:** {len(self.participants) + len(self.external_users)}\n"
+            f"**External users:** {external}\n"
+            f"**Exclusions:** {pairs}\n"
+            f"**Mode:** {mode}\n\n"
+            "Add external users and exclusions, then start the draw."
+        )
+
+    async def refresh(self, interaction):
+        if self.message:
+            await self.message.edit(content=self.summary(), view=self)
+
+    @discord.ui.button(label="Add external user", style=discord.ButtonStyle.primary)
+    async def add_external(self, interaction, button):
+        await interaction.response.send_modal(ExternalUserModal(self))
+
+    @discord.ui.button(label="Add exclusion pair", style=discord.ButtonStyle.secondary)
+    async def add_exclusion(self, interaction, button):
+        if len(self.all_participants) > 25:
+            await interaction.response.send_message(
+                "Discord can only show 25 participants in this selector. "
+                "Reduce the role size before adding exclusions.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Select the two participants who must not be assigned to each other.",
+            view=ExclusionPairView(self),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Start draw", style=discord.ButtonStyle.success)
+    async def start_draw(self, interaction, button):
+        await interaction.response.defer()
+        participants = self.participants + self.external_users
+        assignments = _make_assignments(
+            participants, exclusions=self.exclusions, single_cycle=self.single_cycle
+        )
+        if assignments is None:
+            await interaction.followup.send(
+                "No valid assignment exists with these participants and exclusions."
+            )
+            return
+        self.stop()
+        await interaction.followup.send("The draw is starting; assignments will be sent privately.")
+        await _send_assignments(interaction, assignments, self.role.name)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction, button):
+        self.stop()
+        await interaction.response.edit_message(
+            content="Secret Santa setup cancelled.", view=None
+        )
+
+
+class RoleSelectionView(discord.ui.View):
+    def __init__(self, owner_id, single_cycle=False):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.single_cycle = single_cycle
+        self.role_select = discord.ui.RoleSelect(
+            placeholder="Choose the participant role",
+            min_values=1,
+            max_values=1,
+        )
+        self.role_select.callback = self.role_selected
+        self.add_item(self.role_select)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who started this setup can use it.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def role_selected(self, interaction):
+        role = self.role_select.values[0]
+        if role.is_default() or role.managed:
+            await interaction.response.send_message(
+                "Choose a normal user role, not @everyone or a managed role.",
+                ephemeral=True,
+            )
+            return
+
+        participants = [member for member in role.members if not member.bot]
+        if len(participants) < 2:
+            await interaction.response.send_message(
+                "That role must contain at least two non-bot members.",
+                ephemeral=True,
+            )
+            return
+
+        setup = DrawSetupView(
+            interaction.user.id, role, participants, single_cycle=self.single_cycle
+        )
+        await interaction.response.edit_message(content=setup.summary(), view=setup)
+        setup.message = await interaction.original_response()
+
+
+async def _start_setup(interaction, single_cycle=False):
+    view = RoleSelectionView(interaction.user.id, single_cycle=single_cycle)
+    mode = "single-circle" if single_cycle else "normal"
+    await interaction.response.send_message(
+        f"Choose a participant role to configure a {mode} Secret Santa draw.",
+        view=view,
+        ephemeral=True,
+    )
+
+
 @bot.event
 async def setup_hook():
     await bot.tree.sync()
 
 
-def _rotate_list(lst, k):
-    """Return a new list rotated by k to the right: element i receives lst[(i+k) % n]."""
-    n = len(lst)
-    if n == 0:
-        return []
-    # rotate right by k
-    return [lst[(i - k) % n] for i in range(n)]
-
-
-def _make_assignments(members, exclusions=None, single_cycle=False, max_attempts=2000):
-    """Return assignments list of (giver, receiver) or None if impossible.
-
-    - members: list of discord.Member
-    - exclusions: set of frozenset({id1, id2}) to avoid pairings in either direction
-    - single_cycle: if True, produce a single-cycle permutation (one big circle)
-    """
-
-    print("Making assignments with members:", members)
-    print("Exclusions:", exclusions)
-    print("Single cycle:", single_cycle)
-
-    random.shuffle(members)
-    n = len(members)
-    if n < 2:
-        raise ValueError('Need at least 2 members')
-
-    exclusions = exclusions or set()
-
-    # Helper to test a receivers list against exclusions
-    def valid_with_receivers(receivers):
-        for giver, receiver in zip(members, receivers):
-            if giver.id == receiver.id:
-                return False
-            if frozenset((giver.id, receiver.id)) in exclusions:
-                return False
-        return True
-
-    if single_cycle:
-        # Find k where gcd(k,n)==1 to ensure single cycle
-        ks = [k for k in range(1, n) if gcd(k, n) == 1]
-        random.shuffle(ks)
-        for k in ks:
-            receivers = _rotate_list(members, k)
-            if valid_with_receivers(receivers):
-                print(f"Single-cycle assignment found with k={k}: {len(list(zip(members, receivers)))} assignments")
-                return list(zip(members, receivers))
-            else:
-                print(f"k={k} invalid")  # TODO: Fix so it automatically retries with different shuffles incase of failure
-        return None  # no valid single-cycle assignment possible
-
-    # Not single_cycle: find any derangement that respects exclusions
-    receivers = members.copy()
-    for attempt in range(max_attempts):
-        random.shuffle(receivers)
-        if valid_with_receivers(receivers):
-            return list(zip(members, receivers))
-    # If random attempts fail, there's likely no valid assignment under these constraints
-    return None
-
-
-async def send_assignments(interaction: discord.Interaction, assignments, role_name: str):
-    """Send DMs for assignments and report back in channel."""
-    failed = []
-    for giver, receiver in assignments:
-        giver_name = giver.display_name
-        receiver_name = receiver.display_name
-        message = (
-            f"God jul {giver_name}! Jag har något att säga till dig — håll det hemligt:\n"
-            f"Du har blivit tilldelad att ge en julklapp till {receiver_name}."
-        )
-        try:
-            await giver.send(message)
-        except Exception:
-            logging.exception(f'Failed to send DM to {giver} ({giver.id})')
-            failed.append(giver)
-        await asyncio.sleep(0.5)
-
-    if not failed:
-        await interaction.followup.send(f'Secret Santa assignments sent by DM to {len(assignments)} members (role: {role_name}).')
-    else:
-        failed_names = ', '.join([m.display_name for m in failed])
-        await interaction.followup.send(
-            f'Sent assignments to {len(assignments) - len(failed)} members; failed to DM {len(failed)} members: {failed_names}. '
-            'Check that those users allow DMs from server members or try contacting them directly.'
-        )
-
-
 @bot.event
 async def on_ready():
-    logging.info(f'{bot.user} has connected to Discord!')
+    logging.info("Connected to Discord as %s", bot.user)
 
 
-@bot.tree.command(name='secretsanta', description='Start Secret Santa assignment for a role')
-@discord.app_commands.describe(role_name='The name of the role to use (default: Secret Santa)')
+@bot.tree.command(name="secretsanta", description="Configure and start a Secret Santa draw")
 @discord.app_commands.guild_only()
-async def secretsanta(interaction: discord.Interaction, role_name: str = 'Secret Santa'):
-    """Assign each member with the given role a unique receiver (everyone picked once, nobody receives themself)."""
-    await interaction.response.defer()
-
-    role = discord.utils.get(interaction.guild.roles, name=role_name)
-    if not role:
-        await interaction.followup.send(f"Role '{role_name}' not found.")
-        return
-
-    # Exclude bots from the participant list
-    members = [m for m in role.members if not m.bot]
-    n = len(members)
-    if n < 2:
-        await interaction.followup.send('Need at least 2 non-bot members with that role to run Secret Santa.')
-        return
-
-    # Create a derangement respecting any configured exclusions
-    assignments = _make_assignments(members, exclusions=exclusion_store.exclusions, single_cycle=False)
-    if assignments is None:
-        await interaction.followup.send('Unable to generate Secret Santa assignments with the current exclusions/constraints.')
-        return
-    await send_assignments(interaction, assignments, role_name)
+async def secretsanta(interaction: discord.Interaction):
+    await _start_setup(interaction)
 
 
-@bot.tree.command(name='exclude', description='Exclude two users from being assigned to each other')
-@discord.app_commands.describe(
-    user1='First user to exclude',
-    user2='Second user to exclude'
-)
+@bot.tree.command(name="circle", description="Configure and start a single-circle draw")
 @discord.app_commands.guild_only()
-async def exclude(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member):
-    """Exclude two users from being assigned to each other (both directions)."""
-    await interaction.response.defer()
-    if user1.id == user2.id:
-        await interaction.followup.send("Cannot exclude a user from themselves.")
-        return
-
-    if exclusion_store.add(user1, user2):
-        await interaction.followup.send(f'Exclusion added: {user1.display_name} ↔ {user2.display_name}')
-    else:
-        await interaction.followup.send(f'Exclusion already exists between {user1.display_name} and {user2.display_name}.')
+async def circle(interaction: discord.Interaction):
+    await _start_setup(interaction, single_cycle=True)
 
 
-@bot.tree.command(name='remove_exclusion', description='Remove an exclusion between two users')
-@discord.app_commands.describe(
-    user1='First user to remove exclusion for',
-    user2='Second user to remove exclusion for'
-)
-@discord.app_commands.guild_only()
-async def remove_exclusion(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member):
-    """Remove an exclusion between two users."""
-    await interaction.response.defer()
-    if exclusion_store.remove(user1, user2):
-        await interaction.followup.send(f'Exclusion removed between {user1.display_name} and {user2.display_name}.')
-    else:
-        await interaction.followup.send(f'No exclusion found between {user1.display_name} and {user2.display_name}.')
-
-
-@bot.tree.command(name='list_exclusions', description='List all configured exclusions')
-@discord.app_commands.guild_only()
-async def list_exclusions(interaction: discord.Interaction):
-    """List all configured exclusions."""
-    await interaction.response.send_message(exclusion_store.format_list())
-
-
-@bot.tree.command(name='circle', description='Generate a single-cycle Secret Santa (one big circle)')
-@discord.app_commands.describe(role_name='The name of the role to use (default: Secret Santa)')
-@discord.app_commands.guild_only()
-async def circle(interaction: discord.Interaction, role_name: str = 'Secret Santa'):
-    """Generate a single-cycle Secret Santa where everyone forms one big circle."""
-    await interaction.response.defer()
-    role = discord.utils.get(interaction.guild.roles, name=role_name)
-    if not role:
-        await interaction.followup.send(f"Role '{role_name}' not found.")
-        return
-
-    members = [m for m in role.members if not m.bot]
-    n = len(members)
-    if n < 2:
-        await interaction.followup.send('Need at least 2 non-bot members with that role to run Secret Santa.')
-        return
-
-    assignments = _make_assignments(members, exclusions=exclusion_store.exclusions, single_cycle=True)
-
-    if assignments is None:
-        await interaction.followup.send('Unable to generate a single-cycle assignment under current exclusions/constraints.')
-        return
-
-    await send_assignments(interaction, assignments, role_name)
-
-
-@bot.tree.command(name='circle_exclude', description='Generate a single-cycle assignment while temporarily excluding a pair')
-@discord.app_commands.describe(
-    user1='First user to temporarily exclude',
-    user2='Second user to temporarily exclude',
-    role_name='The name of the role to use (default: Secret Santa)'
-)
-@discord.app_commands.guild_only()
-async def circle_exclude(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member, role_name: str = 'Secret Santa'):
-    """Generate a single-cycle assignment while temporarily excluding a given pair from being assigned to each other."""
-    await interaction.response.defer()
-    temp_pair = frozenset((user1.id, user2.id))
-    role = discord.utils.get(interaction.guild.roles, name=role_name)
-    if not role:
-        await interaction.followup.send(f"Role '{role_name}' not found.")
-        return
-
-    members = [m for m in role.members if not m.bot]
-    n = len(members)
-    if n < 2:
-        await interaction.followup.send('Need at least 2 non-bot members with that role to run Secret Santa.')
-        return
-
-    # Use current exclusions plus temporary pair
-    assignments = _make_assignments(members, exclusions=exclusion_store.exclusions | {temp_pair}, single_cycle=True)
-    if assignments is None:
-        await interaction.followup.send('Unable to generate a single-cycle assignment with that temporary exclusion.')
-        return
-    await send_assignments(interaction, assignments, role_name)
-
-
-if __name__ == '__main__' and DISCORD_BOT_TOKEN:
-    # Only run the bot when executed as a script, not when imported for tests.
+if __name__ == "__main__" and DISCORD_BOT_TOKEN:
     bot.run(DISCORD_BOT_TOKEN)

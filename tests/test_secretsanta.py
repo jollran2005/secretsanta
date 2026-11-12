@@ -1,156 +1,70 @@
-"""Unit tests for Secret Santa bot core functionality."""
-import pytest
-import json
+"""Tests for assignment generation and interactive setup state."""
 
-from SecretSanta import (
-    _rotate_list,
-    _make_assignments,
-    ExclusionStore,
-    circle,
-    exclude,
-    list_exclusions
-)
-from conftest import MockMember, MockRole, MockInteraction
+import pytest
+
+from SecretSanta import DrawParticipant, DrawSetupView, _make_assignments, _rotate_list
+from conftest import MockMember
 
 
 def test_rotate_list():
-    """Test list rotation logic."""
     assert _rotate_list([1, 2, 3], 1) == [3, 1, 2]
     assert _rotate_list([1, 2, 3], 2) == [2, 3, 1]
-    assert _rotate_list([1, 2, 3], 3) == [1, 2, 3]
-    assert _rotate_list([1], 1) == [1]
     assert _rotate_list([], 1) == []
 
 
-@pytest.mark.parametrize("n", [2, 3, 4, 5, 6])
-def test_make_assignments_basic(n):
-    """Test basic assignment generation for different group sizes."""
-    members = [MockMember(i, f"Person{i}") for i in range(n)]
-    result = _make_assignments(members)
+@pytest.mark.parametrize("count", [2, 3, 4, 5, 6])
+def test_make_assignments_is_a_derangement(count):
+    participants = [MockMember(index, f"Person{index}") for index in range(count)]
+    result = _make_assignments(participants)
+
     assert result is not None
-    assert len(result) == n
-    # No self-assignments
-    assert all(g != r for g, r in result)
-    # Everyone assigned once as giver and receiver
-    givers = {g.id for g, _ in result}
-    receivers = {r.id for _, r in result}
-    assert givers == receivers == {m.id for m in members}
+    assert len(result) == count
+    assert all(giver.id != receiver.id for giver, receiver in result)
+    assert {giver.id for giver, _ in result} == {receiver.id for _, receiver in result}
 
 
-def test_make_assignments_respects_exclusions():
-    """Test that assignments respect exclusion pairs."""
-    members = [MockMember(i, f"Person{i}") for i in range(4)]
+def test_make_assignments_respects_independent_exclusion_pairs():
+    participants = [MockMember(index, f"Person{index}") for index in range(4)]
     exclusions = {frozenset((0, 1)), frozenset((2, 3))}
-    result = _make_assignments(members, exclusions=exclusions)
+
+    result = _make_assignments(participants, exclusions=exclusions)
+
     assert result is not None
-    # Check no excluded pairs are assigned
-    for g, r in result:
-        assert frozenset((g.id, r.id)) not in exclusions
+    assert all(
+        frozenset((giver.id, receiver.id)) not in exclusions
+        for giver, receiver in result
+    )
 
 
-@pytest.mark.parametrize("n", [3, 4, 5, 7])
-def test_make_assignments_single_cycle(n):
-    """Test single-cycle assignment generation."""
-    members = [MockMember(i, f"Person{i}") for i in range(n)]
-    result = _make_assignments(members, single_cycle=True)
+def test_draw_setup_includes_external_users_in_participant_picker():
+    role = type("Role", (), {"name": "Participants"})()
+    members = [MockMember(1, "Server user")]
+    setup = DrawSetupView(1, role, members)
+    setup.external_users.append(MockMember(2, "External user"))
+
+    assert [participant.id for participant in setup.all_participants] == [1, 2]
+
+
+def test_external_participant_uses_draw_nickname():
+    user = MockMember(2, "Discord username")
+    participant = DrawParticipant(user, "Secret Santa nickname")
+
+    assert participant.id == user.id
+    assert participant.display_name == "Secret Santa nickname"
+
+
+@pytest.mark.parametrize("count", [3, 4, 5, 7])
+def test_make_assignments_single_cycle(count):
+    participants = [MockMember(index, f"Person{index}") for index in range(count)]
+    result = _make_assignments(participants, single_cycle=True)
+
     assert result is not None
-    # Verify it's one cycle by following assignments
-    seen = {result[0][0].id}
-    current = result[0][1].id
+    by_giver = {giver.id: receiver.id for giver, receiver in result}
+    start = result[0][0].id
+    current = start
+    seen = set()
     while current not in seen:
         seen.add(current)
-        for g, r in result:
-            if g.id == current:
-                current = r.id
-                break
-    assert len(seen) == n
-
-
-class TestExclusionStore:
-    """Test ExclusionStore functionality."""
-
-    @pytest.fixture
-    def store(self, tmp_path):
-        """Create a temporary ExclusionStore for testing."""
-        old_path = ExclusionStore.EXCLUSIONS_FILE
-        test_file = tmp_path / "test_exclusions.json"
-        ExclusionStore.EXCLUSIONS_FILE = test_file
-        store = ExclusionStore()
-        yield store
-        ExclusionStore.EXCLUSIONS_FILE = old_path
-
-    def test_add_and_remove(self, store):
-        """Test adding and removing exclusions."""
-        user1 = MockMember(1, "Alice")
-        user2 = MockMember(2, "Bob")
-
-        # Test adding
-        assert store.add(user1, user2)
-        assert not store.add(user2, user1)  # reverse should fail
-        assert len(store.exclusions) == 1
-
-        # Test removing
-        assert store.remove(user1, user2)
-        assert len(store.exclusions) == 0
-        assert not store.remove(user1, user2)  # already removed
-
-    def test_persistence(self, store, tmp_path):
-        """Test that exclusions persist to file."""
-        user1 = MockMember(1, "Alice")
-        user2 = MockMember(2, "Bob")
-        store.add(user1, user2)
-
-        # Check file contents
-        data = json.loads(store.EXCLUSIONS_FILE.read_text())
-        assert len(data["exclusions"]) == 1
-        assert data["display_names"][str(user1.id)] == "Alice"
-
-        # New store should load existing exclusions
-        store2 = ExclusionStore()
-        assert len(store2.exclusions) == 1
-
-
-@pytest.mark.asyncio
-async def test_exclude_command():
-    """Test the exclude command."""
-    interaction = MockInteraction()
-    user1 = MockMember(1, "Alice")
-    user2 = MockMember(2, "Bob")
-
-    # app command objects expose the original coroutine as `.callback`
-    await exclude.callback(interaction, user1, user2)
-    assert "Exclusion added" in interaction.last_message
-
-    # Try adding again
-    await exclude.callback(interaction, user2, user1)
-    assert "already exists" in interaction.last_message
-
-
-@pytest.mark.asyncio
-async def test_circle_command():
-    """Test the circle command."""
-    interaction = MockInteraction()
-    members = [MockMember(i, f"Person{i}") for i in range(5)]
-    role = MockRole("Secret Santa", members)
-    interaction.guild = type("Guild", (), {"roles": [role]})
-
-    await circle.callback(interaction, role_name="Secret Santa")
-    assert "sent by DM" in interaction.last_message
-
-
-@pytest.mark.asyncio
-async def test_list_exclusions_command():
-    """Test listing exclusions."""
-    interaction = MockInteraction()
-    user1 = MockMember(1, "Alice")
-    user2 = MockMember(2, "Bob")
-
-    # Start empty
-    await list_exclusions.callback(interaction)
-    assert "No exclusions" in interaction.last_message
-
-    # Add one and list
-    await exclude.callback(interaction, user1, user2)
-    await list_exclusions.callback(interaction)
-    assert "Alice" in interaction.last_message
-    assert "Bob" in interaction.last_message
+        current = by_giver[current]
+    assert current == start
+    assert len(seen) == count

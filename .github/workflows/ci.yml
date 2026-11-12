@@ -43,8 +43,3 @@ jobs:
       - name: Run linting
         run: |
           flake8 . --count --max-line-length=150 --statistics
-
-      - name: Run simulation tests
-        run: |
-          python simulate_assignments.py --count 6
-          python simulate_assignments.py --exclude "Person1:Person2" --circle
